@@ -661,3 +661,41 @@ test('resolveRosterMentions: @hermes in this chat is not a handoff to yourself',
   assert.equal(hits.length, 1)
   assert.equal(hits[0].connectionId, 'mac-mini')
 })
+
+
+test('#92794 invariant: roster identity stays on the directory slug, never the display_name', () => {
+  const { __mergeMultiSourceRoster: merge } = runtime()
+  const local = {
+    profiles: [
+      {
+        name: 'dasiming',
+        display_name: '大司命',
+        connectionId: 'local',
+        connectionKind: 'local',
+        sourceScoped: false
+      },
+      {
+        name: 'default',
+        display_name: '太一',
+        connectionId: 'local',
+        connectionKind: 'local',
+        sourceScoped: false
+      }
+    ]
+  }
+  // A hostile/misconfigured union row that reports the DISPLAY name as the
+  // profile identity must not mint a roster row keyed by it.
+  const union = {
+    primaryConnectionId: 'local',
+    agents: [
+      { connectionId: 'local', connectionKind: 'local', profile: '大司命' },
+      { connectionId: 'local', connectionKind: 'local', profile: 'dasiming' }
+    ]
+  }
+
+  const merged = merge(local, union, 'local', [])
+
+  const names = merged.profiles.map(row => row.name)
+  assert.ok(names.includes('dasiming'), 'the slug-keyed row must survive the merge')
+  assert.ok(!names.includes('大司命'), 'the display_name must never become a roster identity')
+})
