@@ -882,6 +882,7 @@ def init_agent(
     agent._run_conversation_idle = threading.Event()
     agent._run_conversation_idle.set()
     agent._deferred_close_scheduled = False
+    agent._deferred_close_lock = threading.Lock()
     agent._supports_active_turn_redirect = True
 
     # /steer mechanism — inject a user note into the next tool result

@@ -63,6 +63,7 @@ def _bare_agent(**attrs):
     agent._run_conversation_idle = threading.Event()
     agent._run_conversation_idle.set()
     agent._deferred_close_scheduled = False
+    agent._deferred_close_lock = threading.Lock()
     agent._model_request_active = threading.Event()
     agent._client_lock = threading.RLock()
     agent.shutdown_memory_provider = lambda *a, **k: None
@@ -187,6 +188,87 @@ def test_should_defer_false_when_idle():
     agent = _bare_agent()
     assert agent._should_defer_hard_close() is False
     assert isinstance(agent, AIAgent)
+
+
+def test_hard_close_fence_releases_after_exception():
+    agent = _bare_agent()
+
+    try:
+        with agent._fence_hard_close():
+            assert agent._run_conversation_active is True
+            assert not agent._run_conversation_idle.is_set()
+            raise RuntimeError("turn failed")
+    except RuntimeError:
+        pass
+
+    assert agent._run_conversation_active is False
+    assert agent._run_conversation_idle.is_set()
+
+
+def test_deferred_close_is_scheduled_once_under_concurrent_callers(monkeypatch):
+    import run_agent as run_agent_module
+
+    agent = _bare_agent()
+    release = threading.Event()
+    agent._wait_until_safe_to_hard_close = release.wait
+
+    # Make the old check-then-set race deterministic: without the production
+    # lock every caller snapshots False before any caller can publish True.
+    # With the lock, only the first caller waits here; later callers observe
+    # the published True and return without starting another close thread.
+    flag_state = {"value": False, "false_reads": 0}
+    flag_lock = threading.Lock()
+    all_false_reads = threading.Event()
+
+    def read_scheduled(_agent):
+        snapshot = flag_state["value"]
+        if not snapshot:
+            with flag_lock:
+                flag_state["false_reads"] += 1
+                if flag_state["false_reads"] == 8:
+                    all_false_reads.set()
+            all_false_reads.wait(timeout=1.0)
+        return snapshot
+
+    def write_scheduled(_agent, value):
+        flag_state["value"] = value
+
+    monkeypatch.setattr(
+        type(agent),
+        "_deferred_close_scheduled",
+        property(read_scheduled, write_scheduled),
+        raising=False,
+    )
+
+    real_thread = threading.Thread
+    created_deferred = []
+
+    def recording_thread(*args, **kwargs):
+        thread = real_thread(*args, **kwargs)
+        if kwargs.get("name") == "agent-deferred-close":
+            created_deferred.append(thread)
+        return thread
+
+    monkeypatch.setattr(run_agent_module.threading, "Thread", recording_thread)
+
+    callers_ready = threading.Barrier(9)
+
+    def schedule():
+        callers_ready.wait()
+        agent._schedule_deferred_close()
+
+    callers = [real_thread(target=schedule) for _ in range(8)]
+    for caller in callers:
+        caller.start()
+    callers_ready.wait()
+    for caller in callers:
+        caller.join(timeout=2.0)
+
+    assert len(created_deferred) == 1
+    release.set()
+    created_deferred[0].join(timeout=2.0)
+    assert not created_deferred[0].is_alive()
+    assert agent._deferred_close_scheduled is False
 
 
 def test_in_flight_close_does_not_close_codex_session():

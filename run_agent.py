@@ -46,6 +46,8 @@ import time
 import threading
 import uuid
 import warnings
+from contextlib import contextmanager, nullcontext
+from functools import wraps
 from typing import List, Dict, Any, Optional, Callable
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # SDK pulls ~240 ms of imports. We expose `OpenAI` as a thin proxy object
@@ -64,6 +66,19 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from hermes_constants import get_hermes_home
+
+
+def _with_hard_close_fence(method):
+    """Pair the resource fence without changing the wrapped call contract."""
+
+    @wraps(method)
+    def _wrapped(self, *args, **kwargs):
+        fence_factory = getattr(self, "_fence_hard_close", None)
+        fence = fence_factory() if callable(fence_factory) else nullcontext()
+        with fence:
+            return method(self, *args, **kwargs)
+
+    return _wrapped
 
 
 def _launch_cwd_for_session(source: str) -> Optional[str]:
@@ -4620,6 +4635,15 @@ class AIAgent:
         if idle is not None:
             idle.set()
 
+    @contextmanager
+    def _fence_hard_close(self):
+        """Keep hard-close fencing paired across every turn exit path."""
+        self._mark_run_conversation_started()
+        try:
+            yield
+        finally:
+            self._mark_run_conversation_finished()
+
     def _should_defer_hard_close(self) -> bool:
         """True when this thread must not release TLS FDs or SessionDB.
 
@@ -4640,6 +4664,10 @@ class AIAgent:
         if idle is not None:
             idle.wait()
         model_active = getattr(self, "_model_request_active", None)
+        # idle covers the public run_conversation wrapper, but direct model
+        # request paths can set this Event independently and it can change at
+        # the edge of idle.wait(). Recheck it instead of treating idle as the
+        # sole safety condition.
         while model_active is not None and model_active.is_set():
             time.sleep(0.05)
         while getattr(self, "_run_conversation_active", False):
@@ -4647,15 +4675,23 @@ class AIAgent:
 
     def _schedule_deferred_close(self) -> None:
         """Finish close() on a daemon thread after the in-flight worker unwinds."""
-        if getattr(self, "_deferred_close_scheduled", False):
-            return
-        self._deferred_close_scheduled = True
+        schedule_lock = getattr(self, "_deferred_close_lock", None)
+        if schedule_lock is None:
+            # Compatibility for __new__-constructed test/third-party agents.
+            # Production agents receive the lock in init_agent().
+            schedule_lock = threading.Lock()
+            self._deferred_close_lock = schedule_lock
+        with schedule_lock:
+            if getattr(self, "_deferred_close_scheduled", False):
+                return
+            self._deferred_close_scheduled = True
 
         def _finish() -> None:
             try:
                 self._wait_until_safe_to_hard_close()
             finally:
-                self._deferred_close_scheduled = False
+                with schedule_lock:
+                    self._deferred_close_scheduled = False
                 try:
                     self.close()
                 except Exception:
@@ -8642,6 +8678,7 @@ class AIAgent:
                 logger.debug("Conversation root lineage walk failed", exc_info=True)
         return start
 
+    @_with_hard_close_fence
     def run_conversation(
         self,
         user_message: Any,
@@ -8741,11 +8778,6 @@ class AIAgent:
                     _clear_if_owned()
 
         try:
-            # getattr: test doubles / third-party agents bind this method
-            # onto a stub that has no fence helpers (#94248 CI).
-            _mark_started = getattr(self, "_mark_run_conversation_started", None)
-            if callable(_mark_started):
-                _mark_started()
             # Serialize the full load -> run -> flush region across Hermes
             # processes. Gateway's asyncio lease closes alias routing inside one
             # process; this durable lease covers Desktop, CLI resume, gateway,
@@ -9075,65 +9107,57 @@ class AIAgent:
             raise
         finally:
             try:
+                if relay_turn is not None:
+                    relay_runtime.SESSION_COORDINATOR.end_turn(
+                        relay_turn,
+                        outcome=relay_outcome,
+                    )
+            finally:
                 try:
-                    if relay_turn is not None:
-                        relay_runtime.SESSION_COORDINATOR.end_turn(
-                            relay_turn,
-                            outcome=relay_outcome,
+                    if relay_lease is not None:
+                        relay_runtime.SESSION_COORDINATOR.release_conversation(
+                            relay_lease
                         )
                 finally:
-                    try:
-                        if relay_lease is not None:
-                            relay_runtime.SESSION_COORDINATOR.release_conversation(
-                                relay_lease
-                            )
-                    finally:
-                        _stop_durable_turn_lease_refresher()
-                        if (
-                            durable_turn_lease_thread is not None
-                            and durable_turn_lease_thread.is_alive()
-                        ):
-                            durable_turn_lease_thread.join(timeout=1.0)
-                        # Clear any interrupt the refresher may have fired between
-                        # the inner stop and this join. Must run AFTER join so a
-                        # late interrupt does not survive into the next turn.
-                        _clear_durable_turn_lease_interrupt()
-                        if durable_turn_lease is not None:
-                            try:
-                                _turn_db.release_session_turn_lease(
-                                    session_id, durable_turn_lease
-                                )
-                            except Exception:
-                                logger.error(
-                                    "Failed to release session turn lease: %s",
-                                    session_id,
-                                    exc_info=True,
-                                )
-                            if (
-                                getattr(self, "_active_session_turn_lease_holder", None)
-                                == durable_turn_lease
-                            ):
-                                self._active_session_turn_lease_holder = None
-                                self._active_session_turn_lease_ttl_seconds = None
-                        # Always clear mid-turn labels when the turn exits — including
-                        # interrupted early returns that skip finalize_turn. Keep ts.
+                    _stop_durable_turn_lease_refresher()
+                    if (
+                        durable_turn_lease_thread is not None
+                        and durable_turn_lease_thread.is_alive()
+                    ):
+                        durable_turn_lease_thread.join(timeout=1.0)
+                    # Clear any interrupt the refresher may have fired between
+                    # the inner stop and this join. Must run AFTER join so a
+                    # late interrupt does not survive into the next turn.
+                    _clear_durable_turn_lease_interrupt()
+                    if durable_turn_lease is not None:
                         try:
-                            self._reset_activity_labels_after_turn()
+                            _turn_db.release_session_turn_lease(
+                                session_id, durable_turn_lease
+                            )
                         except Exception:
-                            pass
-                        if getattr(self, "_relay_pending_turn_id", None) == relay_turn_id:
-                            self._relay_pending_turn_id = None
-                        if acct_token is not None:
-                            reset_accounting_context(acct_token)
-                        if token is not None:
-                            reset_conversation_context(token)
-            finally:
-                # After SessionDB-touching turn cleanup above. Deferred close()
-                # waiters must not hard-close the handle while this finally
-                # still holds it (#94248).
-                _mark_finished = getattr(self, "_mark_run_conversation_finished", None)
-                if callable(_mark_finished):
-                    _mark_finished()
+                            logger.error(
+                                "Failed to release session turn lease: %s",
+                                session_id,
+                                exc_info=True,
+                            )
+                        if (
+                            getattr(self, "_active_session_turn_lease_holder", None)
+                            == durable_turn_lease
+                        ):
+                            self._active_session_turn_lease_holder = None
+                            self._active_session_turn_lease_ttl_seconds = None
+                    # Always clear mid-turn labels when the turn exits — including
+                    # interrupted early returns that skip finalize_turn. Keep ts.
+                    try:
+                        self._reset_activity_labels_after_turn()
+                    except Exception:
+                        pass
+                    if getattr(self, "_relay_pending_turn_id", None) == relay_turn_id:
+                        self._relay_pending_turn_id = None
+                    if acct_token is not None:
+                        reset_accounting_context(acct_token)
+                    if token is not None:
+                        reset_conversation_context(token)
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """
